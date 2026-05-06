@@ -14,7 +14,7 @@
         }
 
         body {
-            background: #000;
+            background: radial-gradient(circle at center, #080810 0%, #050508 50%, #000000 100%);
             overflow: hidden;
             font-family: 'Outfit', sans-serif;
             cursor: crosshair;
@@ -23,9 +23,12 @@
         }
 
         canvas {
-            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
             width: 100vw;
             height: 100vh;
+            z-index: 2; /* place canvas over watermark */
         }
 
         #ui-overlay {
@@ -56,6 +59,21 @@
             letter-spacing: 2px;
             opacity: 1;
             transition: opacity 1.5s ease;
+        }
+
+        #watermark {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: rgba(255, 255, 255, 0.5); /* slightly dimmer than title so it's a good watermark */
+            font-size: 14px;
+            font-weight: 300;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            z-index: 1; /* below canvas (which is z-index auto) */
+            pointer-events: none;
+            user-select: none;
         }
 
         .fade-out {
@@ -112,9 +130,10 @@
     </style>
 </head>
 <body>
+    <div id="watermark">MADE BY QUOCTRUNG4REAL</div>
     <div id="ui-overlay">
         <div id="title">Interactive Wire Grid</div>
-        <div id="instructions">Click & drag to deform · Drag down to push · Drag up to pull · Pull hard to tear</div>
+        <div id="instructions">Hover to push · Click & drag to grab · Drag hard to tear</div>
     </div>
     <div id="stats">
         <div id="stat-springs"></div>
@@ -122,8 +141,6 @@
         <div id="stat-fps"></div>
     </div>
     <div id="mode-indicator">
-        <button class="mode-btn active" id="btn-push" onclick="setMode('push')">Push / Pull</button>
-        <button class="mode-btn" id="btn-grab" onclick="setMode('grab')">Grab</button>
         <button class="mode-btn" id="btn-reset" onclick="resetGrid()">Reset</button>
     </div>
     <canvas id="canvas"></canvas>
@@ -139,33 +156,36 @@
 
     // --- Configuration ---
     const CONFIG = {
-        // Grid — 1/4 cell size (spacing ~5.5px), cover screen
-        spacing: 5.5,
+        // Grid — doubled from 5.5 to 11px
+        spacing: 11,
         
-        // Physics — tuned for ultra-fine mesh
-        gravity: 0.02,
-        damping: 0.993,
-        stiffness: 0.6,
-        shearStiffness: 0.3,
-        tearDistance: 3.2,
-        substeps: 4,            // physics substeps per frame
-        constraintIters: 6,     // constraint solver iterations per substep
-        zRestoreForce: 0.008,   // restoring force toward original Z
+        // Physics — balanced for performance + quality
+        gravity: 0.03,
+        damping: 0.991,
+        stiffness: 0.55,
+        shearStiffness: 0.25,
+        tearDistance: 2.0,
+        substeps: 2,            // physics substeps per frame
+        constraintIters: 3,     // constraint solver iterations per substep
+        zRestoreForce: 0.006,   // restoring force toward original Z
         
         // Mouse
         mouseRadius: 100,
         mouseStrength: 0.8,
+        grabRadius: 20,         // max distance to grab a particle (px)
         
         // 3D perspective
         perspective: 900,
         cameraZ: -500,
+        cameraX: 0,
+        cameraY: 0,
         
         // Rendering
         lineAlpha: 0.4,
-        dotRadius: 0.6,
+        dotRadius: 0.8,
         dotAlpha: 0.5,
         
-        // Performance — skip rendering every Nth spring for diagonals
+        // Performance
         renderSkipDiag: 2,
     };
 
@@ -173,7 +193,6 @@
     let particles = [];
     let springs = [];
     let mouse = { x: 0, y: 0, px: 0, py: 0, down: false, button: 0 };
-    let mode = 'push';
     let grabbedParticle = null;
     let tornCount = 0;
     let totalSprings = 0;
@@ -181,6 +200,7 @@
     let frameCount = 0;
     let lastFPSTime = performance.now();
     let displayFPS = 60;
+    let WORLD_BOUNDS = { left: 0, right: 0, top: 0, bottom: 0 };
 
     // Pre-computed projection cache
     let projCache = null;
@@ -235,6 +255,29 @@
 
             // Restore Z toward original
             this.z += (this.oz - this.z) * CONFIG.zRestoreForce;
+
+            // Box collisions (left, right, top, bottom)
+            const friction = 0.85; // slide friction along walls
+            
+            if (this.y > WORLD_BOUNDS.bottom) {
+                this.y = WORLD_BOUNDS.bottom;
+                this.py = this.y; // kill vertical velocity
+                this.px = this.x - vx * friction; // apply friction to horizontal slide
+            } else if (this.y < WORLD_BOUNDS.top) {
+                this.y = WORLD_BOUNDS.top;
+                this.py = this.y;
+                this.px = this.x - vx * friction;
+            }
+            
+            if (this.x > WORLD_BOUNDS.right) {
+                this.x = WORLD_BOUNDS.right;
+                this.px = this.x; // kill horizontal velocity
+                this.py = this.y - vy * friction; // apply friction to vertical slide
+            } else if (this.x < WORLD_BOUNDS.left) {
+                this.x = WORLD_BOUNDS.left;
+                this.px = this.x;
+                this.py = this.y - vy * friction;
+            }
         }
 
         // Project 3D to 2D (cached per frame)
@@ -242,8 +285,8 @@
             const rawScale = CONFIG.perspective / (CONFIG.perspective - this.z + CONFIG.cameraZ);
             const scale = rawScale < 0.1 ? 0.1 : (rawScale > 3.0 ? 3.0 : rawScale);
             return {
-                x: width * 0.5 + (this.x - width * 0.5) * scale,
-                y: height * 0.5 + (this.y - height * 0.5) * scale,
+                x: width * 0.5 + (this.x - width * 0.5 - CONFIG.cameraX) * scale,
+                y: height * 0.5 + (this.y - height * 0.5 - CONFIG.cameraY) * scale,
                 scale: scale
             };
         }
@@ -317,26 +360,43 @@
         springs = [];
         tornCount = 0;
 
-        // Calculate cols/rows to fill viewport
-        cols = Math.floor(width / CONFIG.spacing) + 1;
-        rows = Math.floor(height / CONFIG.spacing) + 1;
+        // Make the physical grid large enough to cover the screen at max zoom out (cameraZ = 1000)
+        // At cameraZ = 1000, scale = 900 / (900 + 1000) = 0.473
+        // So target width = width / 0.473 = width * 2.11. Let's use 2.2 for safety margin.
+        const targetWorldWidth = width * 2.2;
+        const targetWorldHeight = height * 2.2;
+
+        let targetCols = Math.floor(targetWorldWidth / CONFIG.spacing) + 1;
+        let targetRows = Math.floor(targetWorldHeight / CONFIG.spacing) + 1;
         
+        let actualSpacing = CONFIG.spacing;
+
         // Limit for performance — cap total particles
-        const maxParticles = 80000;
-        if (cols * rows > maxParticles) {
-            const ratio = Math.sqrt(maxParticles / (cols * rows));
-            cols = Math.floor(cols * ratio);
-            rows = Math.floor(rows * ratio);
+        const maxParticles = 40000;
+        if (targetCols * targetRows > maxParticles) {
+            const ratio = Math.sqrt(maxParticles / (targetCols * targetRows));
+            targetCols = Math.floor(targetCols * ratio);
+            targetRows = Math.floor(targetRows * ratio);
+            // Dynamically adjust spacing so it still covers the large physical area
+            actualSpacing = targetWorldWidth / targetCols;
         }
 
-        const startX = (width - (cols - 1) * CONFIG.spacing) / 2;
-        const startY = (height - (rows - 1) * CONFIG.spacing) / 2;
+        cols = targetCols;
+        rows = targetRows;
+
+        const startX = (width - (cols - 1) * actualSpacing) / 2;
+        const startY = (height - (rows - 1) * actualSpacing) / 2;
+
+        WORLD_BOUNDS.left = startX;
+        WORLD_BOUNDS.right = startX + (cols - 1) * actualSpacing;
+        WORLD_BOUNDS.top = startY;
+        WORLD_BOUNDS.bottom = startY + (rows - 1) * actualSpacing;
 
         // Create particles
         for (let row = 0; row < rows; row++) {
             for (let col = 0; col < cols; col++) {
-                const x = startX + col * CONFIG.spacing;
-                const y = startY + row * CONFIG.spacing;
+                const x = startX + col * actualSpacing;
+                const y = startY + row * actualSpacing;
                 const pinned = row === 0;
                 const p = new Particle(x, y, 0, pinned);
                 p.idx = particles.length;
@@ -374,37 +434,39 @@
         console.log(`Grid: ${cols}x${rows} = ${particles.length} particles, ${springs.length} springs`);
     }
 
+    // --- Un-project screen coords to world coords at given Z ---
+    function unproject(screenX, screenY, z) {
+        const scale = CONFIG.perspective / (CONFIG.perspective - z + CONFIG.cameraZ);
+        const safeScale = scale < 0.1 ? 0.1 : (scale > 3.0 ? 3.0 : scale);
+        return {
+            x: width * 0.5 + CONFIG.cameraX + (screenX - width * 0.5) / safeScale,
+            y: height * 0.5 + CONFIG.cameraY + (screenY - height * 0.5) / safeScale
+        };
+    }
+
     // --- Mouse Interaction ---
     function applyMouseForce() {
-        if (!mouse.down) return;
-
         const mouseDx = mouse.x - mouse.px;
         const mouseDy = mouse.y - mouse.py;
 
-        if (mode === 'grab' && grabbedParticle) {
+        // GRAB: click+hold drags the grabbed particle
+        if (mouse.down && grabbedParticle) {
             const p = grabbedParticle;
             if (!p.pinned) {
-                p.x = mouse.x;
-                p.y = mouse.y;
+                const world = unproject(mouse.x, mouse.y, p.z);
+                // Clamp grab to physical world bounds so we can't drag it outside the box
+                p.x = Math.max(WORLD_BOUNDS.left, Math.min(WORLD_BOUNDS.right, world.x));
+                p.y = Math.max(WORLD_BOUNDS.top, Math.min(WORLD_BOUNDS.bottom, world.y));
             }
-            return;
         }
 
-        // Push/Pull mode — use spatial locality for performance
+        // PUSH/PULL: always active on hover (no click needed)
         const radiusSq = CONFIG.mouseRadius * CONFIG.mouseRadius;
         const invRadius = 1.0 / CONFIG.mouseRadius;
         
         for (let i = 0; i < particles.length; i++) {
             const p = particles[i];
-            if (p.pinned) continue;
-
-            // Quick approximate screen check before full projection
-            const approxDx = p.x - mouse.x;
-            const approxDy = p.y - mouse.y;
-            const approxDistSq = approxDx * approxDx + approxDy * approxDy;
-            
-            // Allow a generous margin for Z-projected positions
-            if (approxDistSq > radiusSq * 4) continue;
+            if (p.pinned || p === grabbedParticle) continue;
 
             const proj = p.project();
             const dx = proj.x - mouse.x;
@@ -413,17 +475,12 @@
 
             if (distSq < radiusSq) {
                 const dist = Math.sqrt(distSq);
-                const force = (1 - dist * invRadius) * CONFIG.mouseStrength;
-
-                // Smooth cubic falloff for more natural feel
                 const t = 1 - dist * invRadius;
                 const smoothForce = t * t * (3 - 2 * t) * CONFIG.mouseStrength;
 
-                p.x += mouseDx * smoothForce * 0.4;
-                p.y += mouseDy * smoothForce * 0.4;
-
-                // Z-axis push/pull
-                p.z += mouseDy * smoothForce * 1.5;
+                p.x += mouseDx * smoothForce * 0.18;
+                p.y += mouseDy * smoothForce * 0.18;
+                p.z += mouseDy * smoothForce * 0.35;
             }
         }
     }
@@ -432,13 +489,14 @@
     function findNearestParticle(mx, my) {
         let nearest = null;
         let nearestDist = Infinity;
+        const maxDistSq = 2500; // 50px search radius
 
         for (const p of particles) {
             const proj = p.project();
             const dx = proj.x - mx;
             const dy = proj.y - my;
             const dist = dx * dx + dy * dy;
-            if (dist < nearestDist && dist < 900) {
+            if (dist < nearestDist && dist < maxDistSq) {
                 nearestDist = dist;
                 nearest = p;
             }
@@ -448,6 +506,9 @@
 
     // --- Physics Step with substeps ---
     function physicsStep() {
+        // Apply mouse force ONCE per frame before physics so constraints and bounds can resolve it
+        applyMouseForce();
+
         for (let sub = 0; sub < CONFIG.substeps; sub++) {
             // Constraint solver — multiple iterations for stability
             for (let iter = 0; iter < CONFIG.constraintIters; iter++) {
@@ -461,9 +522,6 @@
                 particles[i].update();
             }
         }
-
-        // Apply mouse force once per frame
-        applyMouseForce();
     }
 
     // --- Rendering ---
@@ -476,14 +534,6 @@
 
     function render() {
         ctx.clearRect(0, 0, width, height);
-
-        // Background
-        const grad = ctx.createRadialGradient(width * 0.5, height * 0.5, 0, width * 0.5, height * 0.5, Math.max(width, height) * 0.7);
-        grad.addColorStop(0, '#080810');
-        grad.addColorStop(0.5, '#050508');
-        grad.addColorStop(1, '#000000');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, width, height);
 
         // Compute projections
         computeProjections();
@@ -652,9 +702,8 @@
         mouse.px = e.clientX;
         mouse.py = e.clientY;
 
-        if (mode === 'grab') {
-            grabbedParticle = findNearestParticle(mouse.x, mouse.y);
-        }
+        // Always grab the nearest particle on click
+        grabbedParticle = findNearestParticle(mouse.x, mouse.y);
 
         document.getElementById('title').classList.add('fade-out');
         document.getElementById('instructions').classList.add('fade-out');
@@ -687,9 +736,8 @@
         mouse.px = touch.clientX;
         mouse.py = touch.clientY;
 
-        if (mode === 'grab') {
-            grabbedParticle = findNearestParticle(mouse.x, mouse.y);
-        }
+        // Always grab nearest particle on touch
+        grabbedParticle = findNearestParticle(mouse.x, mouse.y);
 
         document.getElementById('title').classList.add('fade-out');
         document.getElementById('instructions').classList.add('fade-out');
@@ -709,10 +757,31 @@
         grabbedParticle = null;
     });
 
-    // Scroll to adjust mouse radius
+    // Scroll to adjust camera distance (zoom in/out) without losing state
     canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
-        CONFIG.mouseRadius = Math.max(20, Math.min(300, CONFIG.mouseRadius - e.deltaY * 0.3));
+        
+        // Calculate scale before zoom (at z=0)
+        const scaleBefore = CONFIG.perspective / (CONFIG.perspective + CONFIG.cameraZ);
+        
+        // Adjust cameraZ (zoom)
+        CONFIG.cameraZ = Math.max(-600, Math.min(1000, CONFIG.cameraZ + e.deltaY * 1.5));
+        
+        // Calculate scale after zoom (at z=0)
+        const scaleAfter = CONFIG.perspective / (CONFIG.perspective + CONFIG.cameraZ);
+        
+        // Adjust cameraX and cameraY to keep the point under the mouse stationary
+        const mx = mouse.x - width * 0.5;
+        const my = mouse.y - height * 0.5;
+        
+        CONFIG.cameraX += mx * (1 / scaleBefore - 1 / scaleAfter);
+        CONFIG.cameraY += my * (1 / scaleBefore - 1 / scaleAfter);
+        
+        // Add gentle limits to camera panning so it doesn't get lost in space
+        const maxPanX = width * 1.5;
+        const maxPanY = height * 1.5;
+        CONFIG.cameraX = Math.max(-maxPanX, Math.min(maxPanX, CONFIG.cameraX));
+        CONFIG.cameraY = Math.max(-maxPanY, Math.min(maxPanY, CONFIG.cameraY));
     }, { passive: false });
 
     window.addEventListener('resize', () => {
@@ -720,20 +789,14 @@
         initGrid();
     });
 
-    // --- Mode control ---
-    function setMode(m) {
-        mode = m;
-        document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-        if (m === 'push') document.getElementById('btn-push').classList.add('active');
-        else if (m === 'grab') document.getElementById('btn-grab').classList.add('active');
-    }
-
     function resetGrid() {
+        CONFIG.cameraX = 0;
+        CONFIG.cameraY = 0;
+        CONFIG.cameraZ = -500;
         initGrid();
     }
 
     // Make functions global
-    window.setMode = setMode;
     window.resetGrid = resetGrid;
 
     // --- Init ---
