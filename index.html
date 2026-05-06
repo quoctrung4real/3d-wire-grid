@@ -777,9 +777,14 @@
         CONFIG.cameraX += mx * (1 / scaleBefore - 1 / scaleAfter);
         CONFIG.cameraY += my * (1 / scaleBefore - 1 / scaleAfter);
         
-        // Add gentle limits to camera panning so it doesn't get lost in space
-        const maxPanX = width * 1.5;
-        const maxPanY = height * 1.5;
+        // Strictly bound camera panning so the grid always covers the screen
+        // Calculate the maximum allowed pan distance based on current scale and physical grid size
+        const gridWidthHalf = (WORLD_BOUNDS.right - WORLD_BOUNDS.left) / 2;
+        const gridHeightHalf = (WORLD_BOUNDS.bottom - WORLD_BOUNDS.top) / 2;
+        
+        const maxPanX = Math.max(0, gridWidthHalf - (width * 0.5) / scaleAfter);
+        const maxPanY = Math.max(0, gridHeightHalf - (height * 0.5) / scaleAfter);
+        
         CONFIG.cameraX = Math.max(-maxPanX, Math.min(maxPanX, CONFIG.cameraX));
         CONFIG.cameraY = Math.max(-maxPanY, Math.min(maxPanY, CONFIG.cameraY));
     }, { passive: false });
