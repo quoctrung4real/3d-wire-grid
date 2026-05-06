@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Interactive 3D Wire Grid Simulation - Push, pull, and tear a realistic metal wire mesh">
+    <title>3D Wire Grid Simulation</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #000;
+            overflow: hidden;
+            font-family: 'Outfit', sans-serif;
+            cursor: crosshair;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #ui-overlay {
+            position: fixed;
+            top: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            text-align: center;
+            pointer-events: none;
+        }
+
+        #title {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 14px;
+            font-weight: 300;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+            opacity: 1;
+            transition: opacity 1.5s ease;
+        }
+
+        #instructions {
+            color: rgba(255, 255, 255, 0.35);
+            font-size: 12px;
+            font-weight: 300;
+            letter-spacing: 2px;
+            opacity: 1;
+            transition: opacity 1.5s ease;
+        }
+
+        .fade-out {
+            opacity: 0 !important;
+        }
+
+        #stats {
+            position: fixed;
+            bottom: 20px;
+            right: 24px;
+            color: rgba(255, 255, 255, 0.2);
+            font-size: 11px;
+            font-weight: 300;
+            letter-spacing: 1px;
+            z-index: 10;
+            text-align: right;
+            line-height: 1.6;
+        }
+
+        #mode-indicator {
+            position: fixed;
+            bottom: 20px;
+            left: 24px;
+            z-index: 10;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .mode-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: rgba(255, 255, 255, 0.4);
+            padding: 6px 14px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 11px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.3s ease;
+        }
+
+        .mode-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .mode-btn.active {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.3);
+            color: rgba(255, 255, 255, 0.8);
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-overlay">
+        <div id="title">Interactive Wire Grid</div>
+        <div id="instructions">Click & drag to deform · Drag down to push · Drag up to pull · Pull hard to tear</div>
+    </div>
+    <div id="stats">
+        <div id="stat-springs"></div>
+        <div id="stat-torn"></div>
+    </div>
+    <div id="mode-indicator">
+        <button class="mode-btn active" id="btn-push" onclick="setMode('push')">Push / Pull</button>
+        <button class="mode-btn" id="btn-grab" onclick="setMode('grab')">Grab</button>
+        <button class="mode-btn" id="btn-reset" onclick="resetGrid()">Reset</button>
+    </div>
+    <canvas id="canvas"></canvas>
+
+    <script>
+    // ============================================================
+    // 3D INTERACTIVE WIRE GRID SIMULATION
+    // Spring-mass physics with tearing
+    // ============================================================
+
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // --- Configuration ---
+    const CONFIG = {
+        // Grid
+        cols: 60,
+        rows: 40,
+        spacing: 22, // px between nodes
+        
+        // Physics
+        gravity: 0.12,
+        damping: 0.985,
+        stiffness: 0.4,
+        tearDistance: 2.8, // multiplier of rest length before tearing
+        
+        // Mouse
+        mouseRadius: 120,
+        mouseStrength: 1.2,
+        
+        // 3D perspective
+        perspective: 800,
+        cameraZ: -600,
+        
+        // Rendering
+        lineAlpha: 0.35,
+        dotRadius: 1.5,
+        dotAlpha: 0.6,
+    };
+
+    let width, height;
+    let particles = [];
+    let springs = [];
+    let mouse = { x: 0, y: 0, px: 0, py: 0, down: false, button: 0 };
+    let mode = 'push'; // 'push' or 'grab'
+    let grabbedParticle = null;
+    let tornCount = 0;
+    let totalSprings = 0;
+    let animationId;
+    let startTime = Date.now();
+
+    // --- Resize ---
+    function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        width = window.innerWidth;
+        height = window.innerHeight;
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        canvas.style.width = width + 'px';
+        canvas.style.height = height + 'px';
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    // --- Particle ---
+    class Particle {
+        constructor(x, y, z, pinned = false) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.ox = x; // original
+            this.oy = y;
+            this.oz = z;
+            this.px = x; // previous (Verlet)
+            this.py = y;
+            this.pz = z;
+            this.vx = 0;
+            this.vy = 0;
+            this.vz = 0;
+            this.pinned = pinned;
+            this.mass = 1;
+        }
+
+        update(dt) {
+            if (this.pinned) return;
+
+            // Verlet integration
+            let vx = (this.x - this.px) * CONFIG.damping;
+            let vy = (this.y - this.py) * CONFIG.damping;
+            let vz = (this.z - this.pz) * CONFIG.damping;
+
+            this.px = this.x;
+            this.py = this.y;
+            this.pz = this.z;
+
+            this.x += vx;
+            this.y += vy + CONFIG.gravity;
+            this.z += vz;
+
+            // Clamp Z to prevent extreme projection
+            this.z = Math.max(-500, Math.min(this.z, 500));
+
+            // Subtle restoring force toward original Z
+            this.z += (this.oz - this.z) * 0.002;
+        }
+
+        // Project 3D to 2D
+        project() {
+            const rawScale = CONFIG.perspective / (CONFIG.perspective - this.z + CONFIG.cameraZ);
+            const scale = Math.max(0.1, Math.min(rawScale, 3.0)); // Clamp scale
+            return {
+                x: width / 2 + (this.x - width / 2) * scale,
+                y: height / 2 + (this.y - height / 2) * scale,
+                scale: scale
+            };
+        }
+    }
+
+    // --- Spring ---
+    class Spring {
+        constructor(a, b) {
+            this.a = a;
+            this.b = b;
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            const dz = a.z - b.z;
+            this.restLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            this.torn = false;
+            this.tearProgress = 0; // 0 to 1, visual feedback
+        }
+
+        update() {
+            if (this.torn) return;
+
+            const dx = this.b.x - this.a.x;
+            const dy = this.b.y - this.a.y;
+            const dz = this.b.z - this.a.z;
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (dist === 0) return;
+
+            // Check tearing
+            const stretchRatio = dist / this.restLength;
+            this.tearProgress = Math.max(0, (stretchRatio - 1.5) / (CONFIG.tearDistance - 1.5));
+
+            if (stretchRatio > CONFIG.tearDistance) {
+                this.torn = true;
+                tornCount++;
+                return;
+            }
+
+            const diff = (dist - this.restLength) / dist;
+            const offsetX = dx * diff * CONFIG.stiffness * 0.5;
+            const offsetY = dy * diff * CONFIG.stiffness * 0.5;
+            const offsetZ = dz * diff * CONFIG.stiffness * 0.5;
+
+            if (!this.a.pinned) {
+                this.a.x += offsetX;
+                this.a.y += offsetY;
+                this.a.z += offsetZ;
+            }
+            if (!this.b.pinned) {
+                this.b.x -= offsetX;
+                this.b.y -= offsetY;
+                this.b.z -= offsetZ;
+            }
+        }
+    }
+
+    // --- Initialize Grid ---
+    function initGrid() {
+        particles = [];
+        springs = [];
+        tornCount = 0;
+
+        const startX = (width - (CONFIG.cols - 1) * CONFIG.spacing) / 2;
+        const startY = (height - (CONFIG.rows - 1) * CONFIG.spacing) / 2;
+
+        // Create particles
+        for (let row = 0; row < CONFIG.rows; row++) {
+            for (let col = 0; col < CONFIG.cols; col++) {
+                const x = startX + col * CONFIG.spacing;
+                const y = startY + row * CONFIG.spacing;
+                const z = 0;
+                // Pin top row
+                const pinned = row === 0;
+                particles.push(new Particle(x, y, z, pinned));
+            }
+        }
+
+        // Create springs (horizontal + vertical)
+        for (let row = 0; row < CONFIG.rows; row++) {
+            for (let col = 0; col < CONFIG.cols; col++) {
+                const idx = row * CONFIG.cols + col;
+                // Right neighbor
+                if (col < CONFIG.cols - 1) {
+                    springs.push(new Spring(particles[idx], particles[idx + 1]));
+                }
+                // Bottom neighbor
+                if (row < CONFIG.rows - 1) {
+                    springs.push(new Spring(particles[idx], particles[idx + CONFIG.cols]));
+                }
+            }
+        }
+
+        totalSprings = springs.length;
+    }
+
+    // --- Mouse Interaction ---
+    function applyMouseForce() {
+        if (!mouse.down) return;
+
+        const mouseDx = mouse.x - mouse.px;
+        const mouseDy = mouse.y - mouse.py;
+
+        if (mode === 'grab' && grabbedParticle) {
+            const p = grabbedParticle;
+            if (!p.pinned) {
+                p.x = mouse.x;
+                p.y = mouse.y;
+            }
+            return;
+        }
+
+        // Push/Pull mode
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (p.pinned) continue;
+
+            const proj = p.project();
+            const dx = proj.x - mouse.x;
+            const dy = proj.y - mouse.y;
+            const distSq = dx * dx + dy * dy;
+            const radius = CONFIG.mouseRadius;
+
+            if (distSq < radius * radius) {
+                const dist = Math.sqrt(distSq);
+                const force = (1 - dist / radius) * CONFIG.mouseStrength;
+
+                // Apply horizontal drag
+                p.x += mouseDx * force * 0.5;
+                p.y += mouseDy * force * 0.5;
+
+                // Z-axis push/pull based on vertical mouse movement
+                // Drag down = push into screen, drag up = pull out
+                p.z += mouseDy * force * 2.0;
+            }
+        }
+    }
+
+    // --- Find nearest particle ---
+    function findNearestParticle(mx, my) {
+        let nearest = null;
+        let nearestDist = Infinity;
+
+        for (const p of particles) {
+            const proj = p.project();
+            const dx = proj.x - mx;
+            const dy = proj.y - my;
+            const dist = dx * dx + dy * dy;
+            if (dist < nearestDist && dist < 900) { // within 30px
+                nearestDist = dist;
+                nearest = p;
+            }
+        }
+        return nearest;
+    }
+
+    // --- Physics Step ---
+    function physicsStep() {
+        // Update springs (multiple constraint iterations for stability)
+        for (let iter = 0; iter < 3; iter++) {
+            for (let i = 0; i < springs.length; i++) {
+                springs[i].update();
+            }
+        }
+
+        // Update particles
+        for (let i = 0; i < particles.length; i++) {
+            particles[i].update(1);
+        }
+
+        // Apply mouse force
+        applyMouseForce();
+    }
+
+    // --- Rendering ---
+    function render() {
+        ctx.clearRect(0, 0, width, height);
+
+        // Background subtle gradient
+        const grad = ctx.createRadialGradient(width / 2, height / 2, 0, width / 2, height / 2, Math.max(width, height) * 0.7);
+        grad.addColorStop(0, '#0a0a0f');
+        grad.addColorStop(1, '#000000');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, width, height);
+
+        // Draw springs (lines)
+        for (let i = 0; i < springs.length; i++) {
+            const s = springs[i];
+            if (s.torn) continue;
+
+            const a = s.a.project();
+            const b = s.b.project();
+
+            // Color based on stretch/tear progress
+            let alpha = CONFIG.lineAlpha * Math.min(a.scale, b.scale);
+            let r = 255, g = 255, bCol = 255;
+
+            if (s.tearProgress > 0) {
+                // Transition from white to orange to red as it stretches
+                r = 255;
+                g = Math.floor(255 * (1 - s.tearProgress * 0.8));
+                bCol = Math.floor(255 * (1 - s.tearProgress));
+                alpha = Math.min(1, alpha + s.tearProgress * 0.5);
+            }
+
+            // Depth-based alpha
+            const avgZ = (s.a.z + s.b.z) / 2;
+            const depthFade = Math.max(0.1, 1 - Math.abs(avgZ) / 400);
+            alpha *= depthFade;
+
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.strokeStyle = `rgba(${r}, ${g}, ${bCol}, ${Math.min(alpha, 0.9).toFixed(3)})`;
+            ctx.lineWidth = Math.max(0.3, Math.min(0.8 * Math.min(a.scale, b.scale), 2.5));
+            ctx.stroke();
+        }
+
+        // Draw intersection dots
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            const proj = p.project();
+
+            // Check if this particle has any active springs
+            let hasConnection = false;
+            // Simple check: just draw if within view
+            if (proj.x < -50 || proj.x > width + 50 || proj.y < -50 || proj.y > height + 50) continue;
+
+            const depthFade = Math.max(0.1, 1 - Math.abs(p.z) / 400);
+            let alpha = CONFIG.dotAlpha * proj.scale * depthFade;
+            
+            // Glow for pinned particles
+            let radius = CONFIG.dotRadius * proj.scale;
+            let color = '255, 255, 255';
+
+            if (p.pinned) {
+                color = '100, 180, 255';
+                alpha = Math.min(1, alpha * 1.5);
+                radius *= 1.2;
+            }
+
+            // Highlight when near mouse
+            if (mouse.down) {
+                const dx = proj.x - mouse.x;
+                const dy = proj.y - mouse.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < CONFIG.mouseRadius) {
+                    const influence = 1 - dist / CONFIG.mouseRadius;
+                    alpha = Math.min(1, alpha + influence * 0.5);
+                    radius += influence * 2;
+                    
+                    // Glow effect
+                    ctx.beginPath();
+                    ctx.arc(proj.x, proj.y, radius * 3, 0, Math.PI * 2);
+                    ctx.fillStyle = `rgba(100, 200, 255, ${influence * 0.08})`;
+                    ctx.fill();
+                }
+            }
+
+            ctx.beginPath();
+            ctx.arc(proj.x, proj.y, radius, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(${color}, ${alpha.toFixed(3)})`;
+            ctx.fill();
+        }
+
+        // Mouse cursor glow
+        if (mouse.down) {
+            const glow = ctx.createRadialGradient(mouse.x, mouse.y, 0, mouse.x, mouse.y, CONFIG.mouseRadius);
+            glow.addColorStop(0, 'rgba(100, 180, 255, 0.06)');
+            glow.addColorStop(0.5, 'rgba(100, 180, 255, 0.02)');
+            glow.addColorStop(1, 'rgba(100, 180, 255, 0)');
+            ctx.fillStyle = glow;
+            ctx.fillRect(mouse.x - CONFIG.mouseRadius, mouse.y - CONFIG.mouseRadius,
+                CONFIG.mouseRadius * 2, CONFIG.mouseRadius * 2);
+        }
+
+        // Update stats
+        const activeSpringCount = springs.filter(s => !s.torn).length;
+        document.getElementById('stat-springs').textContent = `SPRINGS: ${activeSpringCount}`;
+        document.getElementById('stat-torn').textContent = `TORN: ${tornCount}`;
+    }
+
+    // --- Animation Loop ---
+    function animate() {
+        physicsStep();
+        render();
+        animationId = requestAnimationFrame(animate);
+    }
+
+    // --- Event Handlers ---
+    canvas.addEventListener('mousedown', (e) => {
+        mouse.down = true;
+        mouse.button = e.button;
+        mouse.x = e.clientX;
+        mouse.y = e.clientY;
+        mouse.px = e.clientX;
+        mouse.py = e.clientY;
+
+        if (mode === 'grab') {
+            grabbedParticle = findNearestParticle(mouse.x, mouse.y);
+        }
+
+        // Fade out instructions after first interaction
+        document.getElementById('title').classList.add('fade-out');
+        document.getElementById('instructions').classList.add('fade-out');
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+        mouse.px = mouse.x;
+        mouse.py = mouse.y;
+        mouse.x = e.clientX;
+        mouse.y = e.clientY;
+    });
+
+    canvas.addEventListener('mouseup', () => {
+        mouse.down = false;
+        grabbedParticle = null;
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+        mouse.down = false;
+        grabbedParticle = null;
+    });
+
+    // Touch support
+    canvas.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        const touch = e.touches[0];
+        mouse.down = true;
+        mouse.x = touch.clientX;
+        mouse.y = touch.clientY;
+        mouse.px = touch.clientX;
+        mouse.py = touch.clientY;
+
+        if (mode === 'grab') {
+            grabbedParticle = findNearestParticle(mouse.x, mouse.y);
+        }
+
+        document.getElementById('title').classList.add('fade-out');
+        document.getElementById('instructions').classList.add('fade-out');
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        const touch = e.touches[0];
+        mouse.px = mouse.x;
+        mouse.py = mouse.y;
+        mouse.x = touch.clientX;
+        mouse.y = touch.clientY;
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', () => {
+        mouse.down = false;
+        grabbedParticle = null;
+    });
+
+    // Scroll to adjust mouse radius
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        CONFIG.mouseRadius = Math.max(30, Math.min(300, CONFIG.mouseRadius - e.deltaY * 0.3));
+    }, { passive: false });
+
+    window.addEventListener('resize', () => {
+        resize();
+        initGrid();
+    });
+
+    // --- Mode control ---
+    function setMode(m) {
+        mode = m;
+        document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+        if (m === 'push') document.getElementById('btn-push').classList.add('active');
+        else if (m === 'grab') document.getElementById('btn-grab').classList.add('active');
+    }
+
+    function resetGrid() {
+        initGrid();
+    }
+
+    // Make functions global
+    window.setMode = setMode;
+    window.resetGrid = resetGrid;
+
+    // --- Init ---
+    resize();
+    initGrid();
+    animate();
+    </script>
+</body>
+</html>
